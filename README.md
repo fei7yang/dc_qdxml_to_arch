@@ -1,8 +1,8 @@
 # dc_qdxml_to_arch
 
-Teamcenter Quick Deploy XML → Architecture Visualization Tool
+Teamcenter Quick Deploy XML → Architecture Visualization Tool (Generic)
 
-Parse a TC Quick Deploy XML file and generate a self-contained interactive HTML architecture diagram with component statistics, cluster topology, and full-mesh connection visualization.
+Parse any TC Quick Deploy XML file and generate a self-contained interactive HTML architecture diagram. **No hardcoded cluster definitions** — clusters, component roles, and topology are all discovered dynamically from XML attributes.
 
 ## Features
 
@@ -71,16 +71,12 @@ dc_qdxml_to_arch.exe config.xml
 
 ## Cluster Definitions
 
-| Cluster | APP Range | Color |
-|---------|-----------|-------|
-| TcClusterJiTuan1 | APP01-10 | Teal |
-| TcClusterJiTuan2 | APP11-20 | Red |
-| TcClusterJiTuan3 | APP21-30 | Blue |
-| TcClusterJiTuan4 | APP31-38 | Sage |
-| TcClusterHaiWai | APP39-40 | Gold |
-| TcClusterXinJishuYuan | APP41-42 | Plum |
-| TcClusterJiChuYuan | APP43-44 | Mint |
-| TcClusterJieKou | APP45-52 | Amber |
+Clusters are **discovered dynamically** from `fnd0_serverManagerDisplayClusterId` attributes on SM components. Colors are auto-assigned from a palette. No manual updates needed for new deployments.
+
+- FSC master/cache is detected via `fnd0_isMaster` property (TC standard)
+- Corporate server is detected via `fnd0_corporateserver` component
+- Pure BL servers are detected as BL components without SM/WT on the same machine
+- Full-mesh detection checks if every WT connects to all SMs within the same cluster
 
 ## Component Categories
 

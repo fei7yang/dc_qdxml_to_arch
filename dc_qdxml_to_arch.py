@@ -3,6 +3,8 @@
 dc_qdxml_to_arch.py -- Teamcenter Quick Deploy XML -> Architecture Visualization
 
 Output: self-contained HTML with light/dark theme toggle, component stats table, interactive SVG.
+
+Clusters are discovered dynamically from SM component attributes — no hardcoded definitions.
 """
 
 import xml.etree.ElementTree as ET
@@ -10,23 +12,7 @@ import json, sys, os, re
 from collections import defaultdict
 
 # ══════════════════════════════════════════════════════════════════════
-# Cluster Definitions
-# ══════════════════════════════════════════════════════════════════════
-
-CLUSTER_MAP = {
-    "TcClusterJiTuan1":      (1,  10,  "#4ECDC4"),
-    "TcClusterJiTuan2":      (11, 20,  "#FF6B6B"),
-    "TcClusterJiTuan3":      (21, 30,  "#45B7D1"),
-    "TcClusterJiTuan4":      (31, 38,  "#96CEB4"),
-    "TcClusterHaiWai":       (39, 40,  "#E6A817"),
-    "TcClusterXinJishuYuan": (41, 42,  "#DDA0DD"),
-    "TcClusterJiChuYuan":    (43, 44,  "#98D8C8"),
-    "TcClusterJieKou":       (45, 52,  "#D4AC0D"),
-}
-CLUSTER_ORDER = list(CLUSTER_MAP.keys())
-
-# ══════════════════════════════════════════════════════════════════════
-# Category / Component definitions
+# Category / Component definitions (TC standard — generic for any deployment)
 # ══════════════════════════════════════════════════════════════════════
 
 CAT_COLORS = {
@@ -48,7 +34,6 @@ CAT_ORDER = ["fsc", "db", "aw", "solr", "dispatcher", "vis", "tccs",
              "client_2tier", "client_4tier", "client_mass", "single_bl",
              "msf", "license", "vault"]
 
-# component_id -> (infra_category, display_label)
 COMP_CAT = {cid: (cat, lbl) for cid, (cat, lbl) in [
     ("fnd0_fsc_keys",               ("fsc",  "FSC Keys")),
     ("fnd0_fsc_group",              ("fsc",  "FSC Group")),
@@ -73,7 +58,6 @@ COMP_CAT = {cid: (cat, lbl) for cid, (cat, lbl) in [
     ("fnd0_licensingserver",        ("license", "LicenseSrv")),
 ]}
 
-# Component ID -> description for stats
 COMP_DESC = {
     "fnd0_fsc": "FSC Server", "fnd0_fsc_keys": "FSC Keys", "fnd0_fsc_group": "FSC Group",
     "fnd0_blserver": "BL Server", "fnd0_corporateserver": "Corporate Server",
@@ -96,7 +80,6 @@ COMP_DESC = {
     "aws2_vispoolassigner": "VIS Pool Assigner", "aws2_visservermanager": "VIS Server Manager",
 }
 
-# Infra category -> [(component_id, display_name), ...] for stats table
 CAT_COMPONENT_IDS = {
     "fsc":         [("fnd0_fsc", "FSC Server"), ("fnd0_fsc_keys", "FSC Keys"), ("fnd0_fsc_group", "FSC Group")],
     "db":          [("fnd0_tcdbserver", "TC DB Server"), ("fnd0_serverpool_DBConfig", "Pool DB Config")],
@@ -119,21 +102,52 @@ CAT_COMPONENT_IDS = {
     "vault":       [("fnd0_vault", "Vault Server")],
 }
 
+# Auto-assigned cluster color palette
+PALETTE = ["#4ECDC4", "#FF6B6B", "#45B7D1", "#96CEB4", "#E6A817",
+           "#DDA0DD", "#98D8C8", "#D4AC0D", "#FF8C42", "#6C5B7B",
+           "#C06C84", "#355C7D", "#F67280", "#99B898", "#E84A5F"]
+
 
 def app_num(name):
+    """Extract trailing number from a machine name (eg. APP01->1, APP123->123)."""
     m = re.search(r"(\d+)$", name)
     return int(m.group(1)) if m else 0
 
 
-def get_cluster(app_name):
-    n = app_num(app_name)
-    for cn, (lo, hi, *_ ) in CLUSTER_MAP.items():
-        if lo <= n <= hi: return cn
-    return None
+def discover_clusters(components):
+    """
+    Dynamically discover clusters from SM components.
+    Returns (machine_to_cluster, cluster_data).
 
+    machine_to_cluster: {machine_name: cluster_name}
+    cluster_data: {cluster_name: {"color": str, "members": [machine_names]}}
+    """
+    cluster_members = defaultdict(list)
 
-def is_cache(name):
-    return bool(re.match(r"^(XA|TH|US|IND|BA|HUN|[A-Z]{2})CACHE\d+$", name, re.IGNORECASE))
+    for c in components:
+        if c["id"] == "fnd0_serverManager":
+            mn = c["machineName"]
+            cluster_name = c["props"].get("fnd0_serverManagerDisplayClusterId", "Unnamed")
+            cluster_members[cluster_name].append(mn)
+
+    # Also cover machines that have WT but no SM (inherits from connected SM cluster)
+    # by expanding: if WT connects to SM, WT's machine gets the same cluster
+    # Handled later in classify — for now, build from SM data
+
+    machine_to_cluster = {}
+    cluster_data = {}
+
+    sorted_clusters = sorted(cluster_members.items(), key=lambda x: x[0])
+    for i, (cname, members) in enumerate(sorted_clusters):
+        color = PALETTE[i % len(PALETTE)]
+        for mn in members:
+            machine_to_cluster[mn] = cname
+        cluster_data[cname] = {
+            "color": color,
+            "members": sorted(members, key=app_num),
+        }
+
+    return machine_to_cluster, cluster_data
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -177,7 +191,7 @@ def parse_xml(path):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 2. Classification
+# 2. Classification (dynamic clusters)
 # ══════════════════════════════════════════════════════════════════════
 
 def classify(components, clients):
@@ -186,13 +200,52 @@ def classify(components, clients):
         "cache_fsc": [],
         "clusters": {},
         "comp_counts": defaultdict(int),
-        "tccs_counts": defaultdict(int),  # per rich-client type
+        "tccs_counts": defaultdict(int),
+        "cluster_data": {},  # cluster_name → {color, members}
     }
 
-    sm_index, wt_index = {}, {}
+    # ── Phase 1: discover clusters from SM data ──
+    machine_to_cluster, cluster_data = discover_clusters(components)
+
+    # Expand: WT machines not in machine_to_cluster → inherit from connected SM
+    wt_connects = {}
+    for c in components:
+        if c["id"] == "fnd0_j2ee_tcwebtier":
+            mn = c["machineName"]
+            for conn in c.get("connectedTo", []):
+                if conn["component"] == "fnd0_serverManager":
+                    wt_connects.setdefault(mn, []).append(conn["machineName"])
+
+    changed = True
+    while changed:
+        changed = False
+        for wt_mn, sm_list in wt_connects.items():
+            if wt_mn in machine_to_cluster:
+                continue
+            for sm_mn in sm_list:
+                if sm_mn in machine_to_cluster:
+                    cname = machine_to_cluster[sm_mn]
+                    machine_to_cluster[wt_mn] = cname
+                    if wt_mn not in cluster_data[cname]["members"]:
+                        cluster_data[cname]["members"].append(wt_mn)
+                    changed = True
+                    break
+
+    # Sort cluster members
+    for cd in cluster_data.values():
+        cd["members"].sort(key=app_num)
+
+    arch["cluster_data"] = cluster_data
+
+    # Init clusters dict
+    for cname, cd in sorted(cluster_data.items()):
+        arch["clusters"][cname] = {"color": cd["color"], "apps": {}}
+
+    # ── Phase 2: index SM/WT info ──
+    sm_index = {}
+    wt_index = {}
     for c in components:
         cid = c["id"]
-        arch["comp_counts"][cid] += 1
         if cid == "fnd0_serverManager":
             sm_index[c["machineName"]] = {
                 "cluster": c["props"].get("fnd0_serverManagerDisplayClusterId", ""),
@@ -203,13 +256,14 @@ def classify(components, clients):
                 "app_name": c["props"].get("fnd0_j2ee_applicationName", ""),
             }
 
+    # Count
+    for c in components:
+        arch["comp_counts"][c["id"]] += 1
     for cl in clients:
         arch["comp_counts"][cl["id"]] += 1
 
-    # Rich client machine sets for TCCS matching
-    rc_machines = {
-        "client_2tier": set(), "client_4tier": set(), "client_mass": set(),
-    }
+    # Rich client machine sets
+    rc_machines = {"client_2tier": set(), "client_4tier": set(), "client_mass": set()}
     all_items = components + clients
     for item in all_items:
         cid, mn = item["id"], item["machineName"]
@@ -217,101 +271,123 @@ def classify(components, clients):
         elif cid == "fnd0_4tierrichclient": rc_machines["client_4tier"].add(mn)
         elif cid == "eda0_client": rc_machines["client_mass"].add(mn)
 
-    # Init clusters
-    for cn in CLUSTER_ORDER:
-        _, _, color = CLUSTER_MAP[cn]
-        arch["clusters"][cn] = {"color": color, "apps": {}}
-
-    # Containerconfig
+    # Corporate server detection
+    corp_machine = None
     container_registry = None
     for c in components:
+        if c["id"] == "fnd0_corporateserver":
+            corp_machine = c["machineName"]
         if c["id"] == "fnd0_containerconfig":
             container_registry = {
                 "manager": c["props"].get("fnd0_containerconfig_containerManager", ""),
                 "registry": c["props"].get("fnd0_containerconfig_containerRegistry", ""),
             }
-            break
 
-    # Process items
+    # ── Phase 3: classify components ──
     for item in all_items:
         cid, mn = item["id"], item["machineName"]
 
+        # Standard component → infra group
         if cid in COMP_CAT:
             cat, lbl = COMP_CAT[cid]
             arch["infra_groups"][cat]["items"].append({"machine": mn, "label": lbl, "is_master": False})
             continue
+
+        # Container registry
         if cid == "fnd0_containerconfig" and container_registry:
             arch["infra_groups"]["msf"]["items"].append({
                 "machine": container_registry["registry"], "label": "Registry", "is_master": False,
             })
             continue
+
+        # Corporate server → skip (tracked above)
         if cid == "fnd0_corporateserver":
             continue
-        if cid == "fnd0_fsc" and re.match(r"^FSC\d+$", mn):
-            arch["infra_groups"]["fsc"]["items"].append({"machine": mn, "label": "Master", "is_master": True})
-            continue
-        if cid == "fnd0_fsc" and is_cache(mn):
-            arch["cache_fsc"].append({"machine": mn})
-            continue
 
-        # TCCS -> separate category (all TCCS clients together)
+        # FSC: use fnd0_isMaster property (TC standard) for master/cache distinction
+        if cid == "fnd0_fsc":
+            is_master = item["props"].get("fnd0_isMaster", "").lower() == "true"
+            if is_master:
+                # Dedicated master FSC (e.g. FSC01-08)
+                arch["infra_groups"]["fsc"]["items"].append({
+                    "machine": mn, "label": "Master", "is_master": True,
+                })
+                continue
+            elif mn in machine_to_cluster:
+                # Co-located on cluster APP machine → set has_fsc, not standalone
+                pass  # fall through to cluster processing
+            else:
+                # Standalone non-master → cache / external
+                arch["cache_fsc"].append({"machine": mn})
+                continue
+
+        # TCCS → separate category
         if cid == "fnd0_tccs":
             arch["infra_groups"]["tccs"]["items"].append({"machine": mn, "label": "TCCS", "is_master": False})
-            # Also track which rich-client type it matched (for info only)
             for cat in ["client_2tier", "client_4tier", "client_mass"]:
                 if mn in rc_machines[cat]:
                     arch["tccs_counts"][cat] += 1; break
             continue
 
-        cluster = get_cluster(mn)
-        if not cluster or cluster not in arch["clusters"]: continue
+        # Cluster members
+        cname = machine_to_cluster.get(mn)
+        if not cname or cname not in arch["clusters"]:
+            continue
 
-        apps = arch["clusters"][cluster]["apps"]
+        apps = arch["clusters"][cname]["apps"]
         if mn not in apps:
-            si, wi = sm_index.get(mn, {}), wt_index.get(mn, {})
+            si = sm_index.get(mn, {})
+            wi = wt_index.get(mn, {})
             apps[mn] = {
-                "sm_pool": si.get("pool", ""), "wt_appname": wi.get("app_name", ""),
+                "sm_pool": si.get("pool", ""),
+                "wt_appname": wi.get("app_name", ""),
                 "has_webtier": False, "has_sm": False, "has_fsc": False,
                 "has_bl": False, "is_corp": False, "wt_connects_to": [],
             }
         app = apps[mn]
+
         if cid == "fnd0_j2ee_tcwebtier":
             app["has_webtier"] = True
             app["wt_connects_to"] = [c["machineName"] for c in item["connectedTo"]
                                      if c["component"] == "fnd0_serverManager"]
-        elif cid == "fnd0_serverManager": app["has_sm"] = True
-        elif cid == "fnd0_fsc": app["has_fsc"] = True
-        elif cid == "fnd0_blserver": app["has_bl"] = True
+        elif cid == "fnd0_serverManager":
+            app["has_sm"] = True
+        elif cid == "fnd0_fsc":
+            app["has_fsc"] = True
+        elif cid == "fnd0_blserver":
+            app["has_bl"] = True
 
     # ── Post-processing ──
 
-    # Extract pure BL servers (has_bl, but no SM, no WT) -> move to single_bl
+    # Extract pure BL servers (has_bl, no SM, no WT) → single_bl
     pure_bl_machines = []
-    for cn in list(arch["clusters"].keys()):
+    for cname in list(arch["clusters"].keys()):
         to_remove = []
-        for an, app in arch["clusters"][cn]["apps"].items():
+        for an, app in arch["clusters"][cname]["apps"].items():
             if app.get("has_bl") and not app["has_sm"] and not app["has_webtier"]:
                 pure_bl_machines.append(an)
                 to_remove.append(an)
         for an in to_remove:
-            del arch["clusters"][cn]["apps"][an]
-        if not arch["clusters"][cn]["apps"]:
-            del arch["clusters"][cn]
+            del arch["clusters"][cname]["apps"][an]
+        if not arch["clusters"][cname]["apps"]:
+            del arch["clusters"][cname]
 
     for mn in sorted(pure_bl_machines, key=app_num):
         arch["infra_groups"]["single_bl"]["items"].append({"machine": mn, "label": "Pure BL", "is_master": False})
 
-    # Mark APP01 as corporate
-    for cn in arch["clusters"]:
-        for an, app in arch["clusters"][cn]["apps"].items():
-            if an == "APP01": app["is_corp"], app["has_bl"] = True, False
+    # Mark corporate server
+    if corp_machine:
+        for cname in arch["clusters"]:
+            if corp_machine in arch["clusters"][cname]["apps"]:
+                arch["clusters"][cname]["apps"][corp_machine]["is_corp"] = True
+                arch["clusters"][cname]["apps"][corp_machine]["has_bl"] = False
+                break
 
     # Full-mesh detection per cluster
-    for cn, cd in arch["clusters"].items():
+    for cname, cd in arch["clusters"].items():
         all_apps = cd["apps"]
         sm_set = {an for an, a in all_apps.items() if a["has_sm"]}
         wt_set = {an for an, a in all_apps.items() if a["has_webtier"]}
-        # Check if every WT connects to every SM
         full = True
         for wt_name in wt_set:
             wt = all_apps[wt_name]
@@ -322,12 +398,12 @@ def classify(components, clients):
         cd["mesh_sm"] = len(sm_set)
         cd["full_mesh"] = full and cd["mesh_wt"] >= 2 and cd["mesh_sm"] >= 2
 
-    # Sort
+    # Sort infra items
     arch["cache_fsc"].sort(key=lambda x: x["machine"])
     for cat in arch["infra_groups"]:
         arch["infra_groups"][cat]["items"].sort(key=lambda x: (0 if x.get("is_master") else 1, x["machine"]))
 
-    return arch
+    return arch, machine_to_cluster
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -340,7 +416,7 @@ MID_GAP = 64
 INFRA_ITEM_W, INFRA_ITEM_H, INFRA_GAP = 220, 36, 8
 
 
-def layout(arch):
+def layout(arch, machine_to_cluster):
     el = {"zones": [], "nodes": [], "links": [], "labels": [], "mesh_bands": []}
     y = 10
 
@@ -357,7 +433,7 @@ def layout(arch):
         })
         ix = 180
         for it in items:
-            lbl = "★ " + it["label"] if it.get("is_master") else it["label"]
+            lbl = it["label"]
             el["nodes"].append({
                 "id": f"infra_{cat}_{it['machine']}",
                 "x": ix, "y": y + 3, "w": 160, "h": INFRA_ITEM_H,
@@ -369,10 +445,10 @@ def layout(arch):
         y += INFRA_ITEM_H + 10
     y += 12
 
-    # ═══ Clusters ═══
+    # ═══ Clusters (dynamic order) ═══
     clusters = arch["clusters"]
-    for cn in CLUSTER_ORDER:
-        if cn not in clusters: continue
+    cluster_names = sorted(clusters.keys())
+    for cn in cluster_names:
         cdata = clusters[cn]
         apps, n = cdata["apps"], len(cdata["apps"])
         if n == 0: continue
@@ -381,25 +457,29 @@ def layout(arch):
         row_w = n * COL_W + (n - 1) * COL_GAP + 24
         row_h = SM_TOP + SM_H + MID_GAP + WT_H + 36
 
+        color = cdata["color"]
+        # Zone background
         el["zones"].append({"x": 4, "y": y, "w": row_w + 8, "h": row_h + 4,
-                           "color": cdata["color"], "name": cn})
+                           "color": color, "name": cn})
+
         # Full-mesh band
         if cdata.get("full_mesh"):
             wt_n, sm_n = cdata["mesh_wt"], cdata["mesh_sm"]
             el["mesh_bands"].append({
                 "x": 8, "y": y + SM_TOP + SM_H + 6,
                 "w": row_w, "h": MID_GAP - 12,
-                "color": cdata["color"], "cluster": cn,
+                "color": color, "cluster": cn,
                 "label": f"Full Connection {sm_n}x{sm_n}",
             })
+
         title = f'{cn}  .  {n} APPs'
         if cdata.get("full_mesh"):
             title += f'  [Mesh {cdata["mesh_sm"]}x{cdata["mesh_sm"]}]'
         el["labels"].append({
             "x": 12, "y": y + 4,
-            "text": title,
-            "class": "cluster-title", "color": cdata["color"],
+            "text": title, "class": "cluster-title", "color": color,
         })
+
         sorted_apps = sorted(apps.keys(), key=app_num)
         for i, app_name in enumerate(sorted_apps):
             app = apps[app_name]
@@ -443,51 +523,53 @@ def layout(arch):
             # Links
             wt_top = (cx + COL_W/2, wt_y)
             for tgt_machine in app["wt_connects_to"]:
-                tgt_cluster = get_cluster(tgt_machine)
-                if tgt_cluster and tgt_cluster in clusters:
+                tgt_cname = machine_to_cluster.get(tgt_machine)
+                if tgt_cname and tgt_cname in clusters:
                     el["links"].append({
                         "src_cluster": cn, "src_app": app_name, "src_pos": wt_top,
-                        "tgt_cluster": tgt_cluster, "tgt_app": tgt_machine,
-                        "cross": (cn != tgt_cluster),
+                        "tgt_cluster": tgt_cname, "tgt_app": tgt_machine,
+                        "cross": (cn != tgt_cname),
                         "hidden": cdata.get("full_mesh", False),
                     })
+
         y += row_h + 16
 
     # Resolve links
-    sm_bottoms = { (n["cluster"], n["machine"]): (n["x"]+n["w"]/2, n["y"]+n["h"])
-                  for n in el["nodes"] if n["category"] == "sm" }
+    sm_bottoms = {(n["cluster"], n["machine"]): (n["x"]+n["w"]/2, n["y"]+n["h"])
+                  for n in el["nodes"] if n["category"] == "sm"}
     resolved = []
     for link in el["links"]:
         tk = (link["tgt_cluster"], link["tgt_app"])
         if tk in sm_bottoms:
             x1, y1 = link["src_pos"]; x2, y2 = sm_bottoms[tk]
-            resolved.append({"x1":x1,"y1":y1,"x2":x2,"y2":y2,"cross":link["cross"],
+            resolved.append({"x1":x1, "y1":y1, "x2":x2, "y2":y2, "cross":link["cross"],
                             "src_app": link["src_app"], "hidden": link.get("hidden", False)})
     el["links"] = resolved
 
-    # ═══ Cache FSC ═══
+    # ═══ Standalone FSC ═══
     y += 6
     caches = arch["cache_fsc"]
     CACHE_COLS = 6
-    el["labels"].append({
-        "x": 10, "y": y + 14,
-        "text": f"Cache FSC ({len(caches)} Non-Master, sorted A-Z)",
-        "class": "section",
-    })
-    y += 22
-    for i, item in enumerate(caches):
-        cx = 14 + (i % CACHE_COLS) * (INFRA_ITEM_W + INFRA_GAP)
-        cy = y + (i // CACHE_COLS) * (INFRA_ITEM_H + INFRA_GAP)
-        el["nodes"].append({
-            "id": f"cache_{item['machine']}", "x": cx, "y": cy,
-            "w": INFRA_ITEM_W, "h": INFRA_ITEM_H,
-            "machine": item["machine"], "label": item["machine"],
-            "color": "#9B59B6", "category": "cache",
+    if caches:
+        el["labels"].append({
+            "x": 10, "y": y + 14,
+            "text": f"Standalone FSC ({len(caches)})",
+            "class": "section",
         })
-    cache_rows = max(1, (len(caches) + CACHE_COLS - 1) // CACHE_COLS)
-    y += cache_rows * (INFRA_ITEM_H + INFRA_GAP) + 10
+        y += 22
+        for i, item in enumerate(caches):
+            cx = 14 + (i % CACHE_COLS) * (INFRA_ITEM_W + INFRA_GAP)
+            cy = y + (i // CACHE_COLS) * (INFRA_ITEM_H + INFRA_GAP)
+            el["nodes"].append({
+                "id": f"cache_{item['machine']}", "x": cx, "y": cy,
+                "w": INFRA_ITEM_W, "h": INFRA_ITEM_H,
+                "machine": item["machine"], "label": item["machine"],
+                "color": "#9B59B6", "category": "cache",
+            })
+        cache_rows = max(1, (len(caches) + CACHE_COLS - 1) // CACHE_COLS)
+        y += cache_rows * (INFRA_ITEM_H + INFRA_GAP) + 10
 
-    # Canvas
+    # Canvas size
     max_x = 10
     for z in el["zones"]: max_x = max(max_x, z["x"]+z["w"])
     for n in el["nodes"]: max_x = max(max_x, n["x"]+n.get("w", n.get("r",8)*2))
@@ -506,7 +588,7 @@ def render_svg(elements, meta):
     svg.append(f'<svg id="arch-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
                f'width="{W}" height="{H}" style="background:var(--bg);font-family:Segoe UI,Microsoft YaHei,sans-serif">')
 
-    # ── Mesh Bands ──
+    # Mesh Bands
     for mb in elements.get("mesh_bands", []):
         svg.append(
             f'<rect x="{mb["x"]}" y="{mb["y"]}" width="{mb["w"]}" height="{mb["h"]}" '
@@ -518,14 +600,14 @@ def render_svg(elements, meta):
             f'text-anchor="middle" fill="{mb["color"]}" fill-opacity="0.6" font-size="9">{mb["label"]}</text>'
         )
 
-    # ── Links grouped by src_app ──
+    # Links grouped by src_app
     link_groups = defaultdict(list)
     for link in elements["links"]:
         link_groups[link.get("src_app", "_other")].append(link)
 
     for src_app, links in sorted(link_groups.items()):
         is_hidden = all(l.get("hidden", False) for l in links)
-        cls = f'wt-links' + (' hidden-init' if is_hidden else '')
+        cls = 'wt-links' + (' hidden-init' if is_hidden else '')
         svg.append(f'<g class="{cls}" id="links-{src_app}">')
         for link in links:
             s = "#E74C3C" if link["cross"] else "#3498DB"
@@ -573,7 +655,7 @@ def render_svg(elements, meta):
         elif cat == "infra_item":
             im = node.get("is_master", False)
             sw, so = ("2","0.6") if im else ("1","0.4")
-            lt = "★ "+node["label"] if im else node["label"]
+            lt = node["label"]
             svg.append(
                 f'<rect x="{node["x"]}" y="{node["y"]}" width="{node["w"]}" height="{node["h"]}" '
                 f'rx="3" fill="{node["color"]}" fill-opacity="0.18" '
@@ -608,7 +690,7 @@ def render_svg(elements, meta):
 def build_stats_tables(arch):
     cc = arch["comp_counts"]
 
-    # ── Infra table: category + count ──
+    # Infra table
     infra_rows = []
     for cat in CAT_ORDER:
         items = arch["infra_groups"].get(cat, {}).get("items", [])
@@ -617,19 +699,17 @@ def build_stats_tables(arch):
         tag = f" ({len(masters)} Master)" if masters else ""
         infra_rows.append(f'<tr><td>{CAT_LABELS[cat]}</td><td>{len(items)}{tag}</td></tr>')
 
-    # ── Component detail: Category(colspan) | ID | Name | Count ──
+    # Component detail
     comp_rows = []
     for cat in CAT_ORDER:
         if cat not in CAT_COMPONENT_IDS: continue
         cids = CAT_COMPONENT_IDS[cat]
-        # Count how many rows for rowspan
         row_ids = []
         for cid, name in cids:
             cnt = cc.get(cid, 0)
             if cnt > 0:
                 row_ids.append((cid, name, cnt))
-        if not row_ids:
-            continue
+        if not row_ids: continue
         n_rows = len(row_ids)
         first_row = row_ids[0]
         comp_rows.append(
@@ -641,7 +721,7 @@ def build_stats_tables(arch):
             comp_rows.append(
                 f'<tr><td class="cid">{cid}</td><td>{name}</td><td><strong>{cnt}</strong></td></tr>'
             )
-    # TCCS category (all TCCS in one place)
+
     tccs_cnt = cc.get("fnd0_tccs", 0)
     if tccs_cnt > 0:
         comp_rows.append(
@@ -650,11 +730,10 @@ def build_stats_tables(arch):
             f'<td><strong>{tccs_cnt}</strong></td></tr>'
         )
 
-    # ── Cluster table ──
+    # Dynamic cluster table
     crow = []
-    for cn in CLUSTER_ORDER:
-        if cn not in arch["clusters"]: continue
-        cd = arch["clusters"][cn]
+    for cname in sorted(arch["clusters"].keys()):
+        cd = arch["clusters"][cname]
         n = len(cd["apps"])
         wt = sum(1 for a in cd["apps"].values() if a["has_webtier"])
         sm = sum(1 for a in cd["apps"].values() if a["has_sm"])
@@ -664,20 +743,22 @@ def build_stats_tables(arch):
         info = f"{n} APP"
         if cp: info += f" / Corp {cp}"
         info += f" / BL {bl} / FS {fs} / WT {wt} / SM {sm}"
-        crow.append(f'<tr><td>{cn}</td><td>{info}</td></tr>')
+        crow.append(f'<tr><td>{cname}</td><td>{info}</td></tr>')
     return ''.join(infra_rows), ''.join(comp_rows), ''.join(crow)
 
 
 def build_html(svg_str, meta, arch):
     infra_table, comp_table, cluster_table = build_stats_tables(arch)
     cache_n = len(arch["cache_fsc"])
+    total_comps = sum(arch["comp_counts"].values())
+    n_clusters = len(arch["clusters"])
 
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{meta["configName"]} -- TC 2512 Architecture</title>
+<title>{meta["configName"]} -- TC Architecture</title>
 <style>
 :root {{
   --bg: #0d1117; --fg: #c9d1d9; --sec: #555; --boxtext: #ddd;
@@ -717,7 +798,6 @@ body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:var(--bg);c
 .wt-links.show{{display:block!important}}
 .wt-node{{cursor:pointer;transition:all .15s}}
 .wt-node:hover{{filter:brightness(1.3)}}
-.wt-node.active rect{{stroke:#58a6ff;stroke-width:2.5}}  
 .tooltip{{position:fixed;background:var(--card);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:11px;pointer-events:none;z-index:100;display:none;box-shadow:0 2px 8px rgba(0,0,0,0.3)}}
 </style>
 </head>
@@ -726,15 +806,14 @@ body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:var(--bg);c
   <div id="top">
     <div id="title-block">
       <div class="title-row">
-        <h1>{meta["configName"]} -- TC 2512 Deployment Architecture</h1>
+        <h1>{meta["configName"]} -- TC Deployment Architecture</h1>
         <button id="theme-btn" onclick="toggleTheme()">☀ Light</button>
       </div>
       <div class="sub">
         <span class="tag">Foundation {meta["foundation"]}</span>
-        <span class="tag">APP01-APP52</span>
-        <span class="tag">8 Clusters</span>
-        <span class="tag">{cache_n} Cache</span>
-        <span class="tag total">Total {sum(arch["comp_counts"].values())} Components</span>
+        <span class="tag">{n_clusters} Clusters</span>
+        <span class="tag">{cache_n} Standalone FSC</span>
+        <span class="tag total">Total {total_comps} Components</span>
       </div>
     </div>
   </div>
@@ -760,7 +839,7 @@ body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:var(--bg);c
     <div class="leg"><div class="leg-dot" style="background:#3498DB"></div>Web (AppName)</div>
     <div class="leg"><div class="leg-dot" style="background:#F39C12"></div>Corp/BL</div>
     <div class="leg"><div class="leg-dot" style="background:#2ECC71"></div>FS</div>
-    <div class="leg leg-sep">| WT -> SM (same-app)</div>
+    <div class="leg leg-sep">| WT → SM (same-app)</div>
   </div>
 
   <div id="svg-wrap">
@@ -783,14 +862,13 @@ function toggleTheme() {{
     document.documentElement.classList.add('light');
     document.getElementById('theme-btn').textContent = '🌙 Dark';
   }}
-  // ── WT node click to toggle hidden link groups ──
+  // WT node click to toggle hidden link groups
   var activeNode = null, activeGroup = null;
   document.querySelectorAll('.wt-node').forEach(function(node) {{
     node.addEventListener('click', function(e) {{
       e.stopPropagation();
       var app = this.getAttribute('data-app');
       var group = document.getElementById('links-' + app);
-      // Deactivate previous
       if (activeNode) {{ activeNode.classList.remove('active'); }}
       if (activeGroup && activeGroup !== group) {{ activeGroup.classList.remove('show'); }}
       if (group) {{
@@ -805,7 +883,6 @@ function toggleTheme() {{
       }}
     }});
   }});
-  // Click outside SVG clears
   document.addEventListener('click', function() {{
     if (activeNode) {{ activeNode.classList.remove('active'); }}
     if (activeGroup) {{ activeGroup.classList.remove('show'); }}
@@ -830,6 +907,9 @@ Usage:
     dc_qdxml_to_arch                auto-detect single .xml in current dir
     dc_qdxml_to_arch file.xml       parse specific XML
     dc_qdxml_to_arch file.xml out.html   custom output name
+
+Clusters are discovered automatically from SM component attributes.
+No hardcoded cluster definitions needed.
 
 Output:
     arch.html          interactive architecture diagram (light/dark theme)
@@ -858,20 +938,23 @@ Output:
     print(f"      {meta['configName']} / Foundation {meta['foundation']}  ({total} items)")
 
     print(f"[2/4] Classify...")
-    arch = classify(comps, clis)
+    arch, machine_to_cluster = classify(comps, clis)
+
+    print(f"   Discovered {len(arch['cluster_data'])} clusters:")
+    for cname, cd in sorted(arch["cluster_data"].items()):
+        print(f"      {cname}: {len(cd['members'])} members")
 
     print("   Components:")
     for cid, cnt in sorted(arch["comp_counts"].items(), key=lambda x: -x[1]):
         desc = COMP_DESC.get(cid, "")
         print(f"      {cid:40s} {desc:22s} x{cnt}")
-    print(f"   Clusters: {len(arch['clusters'])}")
-    for cn in CLUSTER_ORDER:
-        if cn not in arch["clusters"]: continue
-        cd = arch["clusters"][cn]
-        print(f"      {cn}: {len(cd['apps'])} APPs")
+    print(f"   Clusters in arch: {len(arch['clusters'])}")
+    for cname in sorted(arch["clusters"].keys()):
+        cd = arch["clusters"][cname]
+        print(f"      {cname}: {len(cd['apps'])} APPs")
 
     print(f"[3/4] Layout & render...")
-    layout_data = layout(arch)
+    layout_data = layout(arch, machine_to_cluster)
     print(f"      Canvas: {layout_data['svg_w']} x {layout_data['svg_h']}  ({len(layout_data['links'])} links)")
 
     svg_str = render_svg(layout_data, meta)
