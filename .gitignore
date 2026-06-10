@@ -1,0 +1,22 @@
+# XML files - never upload
+*.xml
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Conversation records
+_conversation_records/
+
+# Output files
+arch.html
+arch_data.json
+
+# OS files
+Thumbs.db
+.DS_Store
