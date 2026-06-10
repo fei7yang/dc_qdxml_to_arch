@@ -16,6 +16,7 @@ Parse a TC Quick Deploy XML file and generate a self-contained interactive HTML 
 - **Light/Dark theme**: Toggle with button; preference saved to localStorage
 - **Cache FSC display**: Non-master FSC cache servers shown in a sorted grid
 - **JSON data export**: Also outputs `arch_data.json` for downstream tool consumption
+- **Zero dependencies**: Pure Python stdlib — no pip install needed
 
 ## Usage
 
@@ -81,20 +82,6 @@ dc_qdxml_to_arch.exe config.xml
 | TcClusterJiChuYuan | APP43-44 | Mint |
 | TcClusterJieKou | APP45-52 | Amber |
 
-## Connection Validation Rules
-
-The file `Validation.logic` defines 7 connection rules for validating XML configurations:
-
-| Rule | Type | Description |
-|------|------|-------------|
-| R1 | Full-mesh | Web → Pool: each WT connects to all SMs in the same cluster |
-| R2 | Odd/Even | Gateway → VIS: odd→VIS01, even→VIS02 |
-| R3 | 1:1 | BL-Dispatcher → Web: DISP01→APP45, DISP02→APP46 |
-| R4 | 1:1 | BL-DC → Web: DC01→APP47 |
-| R5 | 1:1 | Dispatcher-4tier → Web: →APP52 |
-| R6 | 1:1 | Indexer → Web: →APP52 |
-| R7 | 1:1 | VisPoolAssigner → Web: →APP52 |
-
 ## Component Categories
 
 | Category | Key | Components |
@@ -114,23 +101,36 @@ The file `Validation.logic` defines 7 connection rules for validating XML config
 | License | license | License Server |
 | Vault | vault | Vault Server |
 
-## Technical Details
+## Building the EXE
 
-- **Language**: Python 3.13 (no external dependencies — uses only stdlib)
-- **XML Parser**: `xml.etree.ElementTree`
-- **Rendering**: SVG embedded in self-contained HTML
-- **Packaging**: PyInstaller for standalone EXE (~8MB)
-- **Browser**: Modern browser with CSS custom properties support
+Requires Python 3.13+ and PyInstaller:
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile dc_qdxml_to_arch.py
+```
+
+Output: `output/dc_qdxml_to_arch.exe` (~8MB)
+
+To customize the output directory:
+
+```bash
+pyinstaller --onefile --distpath output dc_qdxml_to_arch.py
+```
 
 ## File Structure
 
 ```
 dc_qdxml_to_arch/
-├── dc_qdxml_to_arch.py    # Main Python script
-├── dc_qdxml_to_arch.exe   # Standalone Windows EXE (in dist/)
-├── Validation.logic        # Connection validation rules (7 rules)
-└── README.md               # This file
+├── dc_qdxml_to_arch.py    # Main Python script (zero dependencies)
+├── output/
+│   └── dc_qdxml_to_arch.exe   # Standalone Windows EXE
+└── README.md
 ```
+
+## Related Projects
+
+- **[dc_qdxml_validator](https://github.com/fei7yang/dc_qdxml_validator)** — Connection validation rules and XML config checker for TC Quick Deploy
 
 ## License
 

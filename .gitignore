@@ -1,9 +1,9 @@
 # XML files - never upload
 *.xml
 
-# PyInstaller build artifacts
+# Build output (exe too large for git)
 build/
-dist/
+output/
 *.spec
 
 # Python cache
