@@ -969,6 +969,12 @@ Output:
     print(f"      JSON: {json_path}")
     print(f"\nDone.")
 
+    # 双击模式：自动打开浏览器预览
+    import webbrowser
+    webbrowser.open(f'file:///{html_path}')
+
+    input('\n按 Enter 键退出...')
+
 
 if __name__ == "__main__":
     main()
