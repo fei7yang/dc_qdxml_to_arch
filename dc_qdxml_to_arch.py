@@ -40,7 +40,7 @@ COMP_CAT = {cid: (cat, lbl) for cid, (cat, lbl) in [
     ("fnd0_tcdbserver",             ("db",   "TCDB")),
     ("fnd0_serverpool_DBConfig",    ("db",   "PoolDB")),
     ("fnd0_httpsconfig",            ("aw",   "HTTPS")),
-    ("aws2_client_builder",         ("aw",   "ClientBldr")),
+    ("aws2_client_builder",         ("aw",   "AW Client")),
     ("aws2_client_gateway_webtier", ("aw",   "Gateway")),
     ("aws2_indexingengine",         ("solr", "Indexing")),
     ("aws2_zookeeper",              ("solr", "ZK")),
@@ -284,8 +284,16 @@ def classify(components, clients):
             }
 
     # ── Phase 3: classify components ──
+    # Collect Solr components per machine for merging (ZK+Indexing Engine per server)
+    solr_per_machine = defaultdict(list)
+
     for item in all_items:
         cid, mn = item["id"], item["machineName"]
+
+        # Solr components: collect per machine, merge later
+        if cid in ("aws2_zookeeper", "aws2_indexingengine", "aws2_ftsIndexer"):
+            solr_per_machine[mn].append(COMP_CAT[cid][1])
+            continue
 
         # Standard component → infra group
         if cid in COMP_CAT:
@@ -359,6 +367,15 @@ def classify(components, clients):
 
     # ── Post-processing ──
 
+    # Merge Solr components per machine (e.g. ZK+Indexing on same server → one row)
+    for mn in sorted(solr_per_machine.keys(), key=app_num):
+        labels = solr_per_machine[mn]
+        # Sort: ZK first, then Indexing, then FTS
+        order = {"ZK": 0, "Indexing": 1, "FTS Idx": 2}
+        labels.sort(key=lambda x: order.get(x, 9))
+        merged_label = "+".join(labels)
+        arch["infra_groups"]["solr"]["items"].append({"machine": mn, "label": merged_label, "is_master": False})
+
     # Extract pure BL servers (has_bl, no SM, no WT) → single_bl
     pure_bl_machines = []
     for cname in list(arch["clusters"].keys()):
@@ -410,10 +427,12 @@ def classify(components, clients):
 # 3. Layout
 # ══════════════════════════════════════════════════════════════════════
 
-COL_W, COL_GAP = 120, 10
-SM_H, WT_H = 48, 42
-MID_GAP = 64
+COL_W, COL_GAP = 90, 6
+SM_H, WT_H = 40, 34
+MID_GAP = 48
 INFRA_ITEM_W, INFRA_ITEM_H, INFRA_GAP = 220, 36, 8
+INFRA_MAX_COLS = 6  # max items per row in infra section
+INFRA_LABEL_W = 170  # left label width
 
 
 def layout(arch, machine_to_cluster):
@@ -431,18 +450,22 @@ def layout(arch, machine_to_cluster):
             "x": 10, "y": y + 20,
             "text": title, "class": "group-title", "color": group["color"],
         })
-        ix = 180
-        for it in items:
-            lbl = it["label"]
+        item_w = 140
+        item_gap = 8
+        for i, it in enumerate(items):
+            col = i % INFRA_MAX_COLS
+            row = i // INFRA_MAX_COLS
+            ix = INFRA_LABEL_W + col * (item_w + item_gap)
+            iy = y + 3 + row * (INFRA_ITEM_H + INFRA_GAP)
             el["nodes"].append({
                 "id": f"infra_{cat}_{it['machine']}",
-                "x": ix, "y": y + 3, "w": 160, "h": INFRA_ITEM_H,
-                "machine": it["machine"], "label": lbl,
+                "x": ix, "y": iy, "w": item_w, "h": INFRA_ITEM_H,
+                "machine": it["machine"], "label": it["label"],
                 "color": group["color"], "is_master": it.get("is_master", False),
                 "category": "infra_item",
             })
-            ix += 170
-        y += INFRA_ITEM_H + 10
+        n_rows = (n_items + INFRA_MAX_COLS - 1) // INFRA_MAX_COLS
+        y += n_rows * (INFRA_ITEM_H + INFRA_GAP) + 6
     y += 12
 
     # ═══ Clusters (dynamic order) ═══
@@ -638,8 +661,8 @@ def render_svg(elements, meta):
         cat = node["category"]
         if cat in ("sm", "webtier"):
             d = node.get("display","")
-            if len(d) > 16: d = d[:14]+".."
-            fs = "10" if len(d) > 10 else "11"
+            if len(d) > 12: d = d[:10]+".."
+            fs = "9" if len(d) > 8 else "10"
             cls = 'wt-node' if cat == 'webtier' else ''
             svg.append(
                 f'<rect x="{node["x"]}" y="{node["y"]}" width="{node["w"]}" height="{node["h"]}" '
@@ -649,7 +672,7 @@ def render_svg(elements, meta):
                 f'<title>{node["machine"]}: {d}</title></rect>'
             )
             svg.append(
-                f'<text x="{node["x"]+node["w"]/2}" y="{node["y"]+node["h"]/2+5}" '
+                f'<text x="{node["x"]+node["w"]/2}" y="{node["y"]+node["h"]/2+4}" '
                 f'text-anchor="middle" fill="var(--boxtext)" font-size="{fs}" font-weight="bold">{d}</text>'
             )
         elif cat == "infra_item":
@@ -769,8 +792,8 @@ def build_html(svg_str, meta, arch):
   --applbl: #57606a; --infolbl: #57606a; --card: #fff; --border: #d0d7de; --th: #eaeef2;
 }}
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--fg);overflow:auto}}
-#app{{padding:14px;min-width:max-content}}
+body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--fg);overflow-x:hidden}}
+#app{{padding:14px;max-width:100%}}
 #top{{margin-bottom:10px}}
 .title-row{{display:flex;align-items:center;gap:12px;margin-bottom:4px}}
 #title-block h1{{font-size:18px;color:var(--fg);white-space:nowrap}}
@@ -928,7 +951,8 @@ Output:
         xml_path = os.path.join(cwd, xmls[0])
         print(f"Auto-detected: {xmls[0]}")
 
-    out_dir = os.path.dirname(os.path.abspath(xml_path))
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(xml_path)), "arch")
+    os.makedirs(out_dir, exist_ok=True)
     html_path = sys.argv[2] if len(sys.argv) >= 3 else os.path.join(out_dir, "arch.html")
     json_path = html_path.replace(".html", "_data.json")
 
